@@ -2,6 +2,7 @@
 
 import math
 import os
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -404,6 +405,83 @@ def test_get_score_returns_same_version_map_and_anchors():
     assert got["tempo_points"][0]["bpm"] == 60
     assert math.isclose(got["anchors"][0]["current_seconds"], 0.0)
     assert math.isclose(got["anchors"][1]["current_seconds"], 4.0)
+
+
+def _publish_via_separate_store(db_path, sid, points):
+    """用独立 Store 连接按修订号 0 -> 1 发布（等价于另一个并发请求）。"""
+    import app.main as main
+    from app.db import Store
+
+    other = Store(str(db_path))
+    score = other.get_score(sid)
+    candidate = main._build_map(score["ppq"], score["time_signatures"], points)
+    evaluated = main._evaluate_replacement(
+        candidate, score["anchors"], raise_on_conflict=True
+    )
+    return other.publish_revision(sid, 0, points, evaluated)
+
+
+def test_get_score_interleaved_with_publish_is_not_spliced_across_revisions(fresh_db):
+    # 可控的读写交错：GET 的读事务读完 scores 行（旧修订 0/120 BPM）、
+    # 尚未读 anchors 行时，另一个连接提交发布（修订 1/60 BPM，未锁定锚点
+    # 2:1:0 秒数 2.0s -> 4.0s）。查询必须返回完整的同一修订：
+    #   旧修订：revision=0、120 BPM、锚点 2.0s
+    #   新修订：revision=1、60 BPM、锚点 4.0s
+    # 任何“revision=0 + 锚点 4.0s”的拼接都说明读跨了两个快照。
+    import app.main as main
+
+    db_path = fresh_db
+    score = create_score()
+    sid = score["id"]
+
+    writer_entered = threading.Event()
+    publish_error: list[Exception] = []
+
+    def interleave(_sid: str):
+        # 在 GET 读事务已固定快照后，让另一连接完成发布事务并提交。
+        def publish():
+            try:
+                _publish_via_separate_store(db_path, _sid, SLOW_POINTS)
+            except Exception as exc:  # noqa: BLE001 - 回传到主线程断言
+                publish_error.append(exc)
+            finally:
+                writer_entered.set()
+
+        t = threading.Thread(target=publish)
+        t.start()
+        assert writer_entered.wait(timeout=5), "并发发布线程未在超时内完成"
+        t.join(timeout=5)
+        assert not t.is_alive(), "并发发布线程未结束"
+
+    main.store.before_anchor_read = interleave
+    try:
+        got = client.get(f"/scores/{sid}").json()
+    finally:
+        main.store.before_anchor_read = None
+
+    assert not publish_error, f"并发发布出错：{publish_error}"
+
+    # 写入必然已经提交（rev1）；本次 GET 返回旧或新修订都允许，但必须完整。
+    assert got["revision"] in (0, 1)
+    if got["revision"] == 0:
+        assert got["tempo_points"][0]["bpm"] == 120
+        assert math.isclose(got["anchors"][0]["current_seconds"], 0.0)
+        assert math.isclose(got["anchors"][1]["current_seconds"], 2.0)
+    else:
+        assert got["tempo_points"][0]["bpm"] == 60
+        assert math.isclose(got["anchors"][0]["current_seconds"], 0.0)
+        assert math.isclose(got["anchors"][1]["current_seconds"], 4.0)
+    # 无论哪个版本，速度图都必须与修订号、锚点秒数互相自洽。
+    assert (got["revision"] == 0) == (got["tempo_points"][0]["bpm"] == 120)
+    assert (got["revision"] == 0) == math.isclose(
+        got["anchors"][1]["current_seconds"], 2.0
+    )
+
+    # 交错结束后再次查询，稳定读到完整的新修订。
+    after = client.get(f"/scores/{sid}").json()
+    assert after["revision"] == 1
+    assert after["tempo_points"][0]["bpm"] == 60
+    assert math.isclose(after["anchors"][1]["current_seconds"], 4.0)
 
 
 # ---------------------------------------------------------------------- #

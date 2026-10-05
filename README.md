@@ -109,7 +109,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    **409**（响应体含 `expected_revision` 与 `current_revision`），
    不会覆盖新版本。
 5. **查询** `GET /scores/{id}`：返回**同一版本**的速度图、修订号与锚点
-   （锁定秒数、未锁定当前秒数、冻结阈值）。
+   （锁定秒数、未锁定当前秒数、冻结阈值）。查询在 SQLite 的**单个读事务
+   （固定读快照）**内一次读出速度点、修订号与全部锚点：即便查询进行中
+   恰好有另一个发布提交，返回的也是**完整的旧修订或完整的新修订**，
+   不会出现“旧修订号/旧速度点 + 新锚点秒数”的跨修订拼接（如旧图
+   120 BPM、修订号 0 却返回 60 BPM 才有的 4 秒锚点）。
 6. 数据保存到 **SQLite**（WAL 模式，发布用 `BEGIN IMMEDIATE` 串行化），
    Docker Compose 命名卷持久化，**重启后仍可读取**。
 
@@ -231,8 +235,35 @@ curl -i -X POST http://localhost:8000/scores/$SID/revisions/0/publish \
 
 ```bash
 curl -s http://localhost:8000/scores/$SID
-# -> "revision": 1，"tempo_points" 为 60 BPM，锚点 current_seconds 与该版本一致
 ```
+
+返回该谱例**当前完整修订**的快照：修订号、速度点表与全部锚点取自同一次
+已提交修订（示例为上面的发布之后，`revision=1`、60 BPM；未锁定锚点
+`2:1:0` 为 4.0 s，锁定锚点秒数仍为创建时冻结的 0.0 s）：
+
+```json
+{
+  "id": "ac0224ce71d34c90bbe6f3a917602bbe",
+  "revision": 1,
+  "ppq": 480,
+  "time_signatures": [],
+  "tempo_points": [{"position": "1:1:0", "bpm": 60.0, "curve": "step"}],
+  "anchors": [
+    {"index": 0, "position": "1:1:0", "locked": true,
+     "total_ticks": 0, "original_seconds": 0.0,
+     "current_seconds": 0.0, "tick_seconds": 0.0010416666666666667},
+    {"index": 1, "position": "2:1:0", "locked": false,
+     "total_ticks": 1920, "original_seconds": 2.0,
+     "current_seconds": 4.0, "tick_seconds": 0.0010416666666666075}
+  ]
+}
+```
+
+> 若查询与一次发布在时间上交错：发布在查询开始前已提交，则整体读到
+> **新修订**（上例）；发布在查询结束后才提交，则整体读到**旧修订**
+> （`revision=0`、120 BPM、`2:1:0` 为 2.0 s）。两种结果都可能，但
+> 同一次响应内修订号、速度点、锚点秒数必定互相自洽，不会跨修订拼接。
+> 谱例不存在时返回 **404**。
 
 ---
 
@@ -541,7 +572,10 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 阈值、预览返回原/新秒数与偏移且不落库、预览/发布的修订号 409、锁定冲突
 422（带锚点索引且数据不变）、偏移恰好等于一 tick 放行、成功发布原子更新
 速度图/未锁定锚点/修订号且锁定秒数不变、按当前修订连续发布、404，以及
-用独立 SQLite 文件重新打开（模拟 Compose 重启）后数据仍可读。
+用独立 SQLite 文件重新打开（模拟 Compose 重启）后数据仍可读。另有
+**可控读写交错回归**：用线程与同步事件让“查询读完谱例行、读锚点前”
+恰好插入另一个连接的发布提交，断言查询返回的修订号、速度点与全部锚点
+同属一个修订（完整旧修订或完整新修订），不发生跨修订拼接。
 
 ## 项目结构
 
@@ -551,7 +585,7 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由、请求/响应模型、422/409/404 错误处理
 │   ├── tempo.py       # 核心引擎：拍号展开、积分换算、同段求逆、校验
-│   └── db.py          # SQLite 持久化：谱例/锚点/修订号，乐观锁原子发布
+│   └── db.py          # SQLite 持久化：谱例/锚点/修订号，读快照查询、乐观锁原子发布
 ├── tests/
 │   ├── conftest.py    # 测试用临时 SQLite（TEMPO_DB_PATH）
 │   ├── test_tempo.py  # 引擎数值/往返/校验测试

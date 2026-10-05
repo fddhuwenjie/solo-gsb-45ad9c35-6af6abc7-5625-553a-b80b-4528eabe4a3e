@@ -10,6 +10,11 @@
 发布是单事务：``BEGIN IMMEDIATE`` 取得写锁后按 revision 做乐观并发控制
 （预期修订号不匹配 -> 409），成功则一次更新速度图、未锁定锚点秒数和
 修订号，锁定锚点秒数不变。进程内再用一把锁串行化写事务。
+
+查询同样是单读事务：``BEGIN DEFERRED`` 后在同一次读快照内取谱例行与
+全部锚点行。WAL 下读快照从首次读起固定，故与发布交错时查询要么返回
+完整的旧修订、要么返回完整的新修订，不会把旧修订的速度点/修订号与
+新修订的锚点秒数拼在一起。
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ import os
 import sqlite3
 import threading
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scores (
@@ -73,6 +78,9 @@ class Store:
         parent = os.path.dirname(os.path.abspath(self.db_path))
         os.makedirs(parent, exist_ok=True)
         self._write_lock = threading.Lock()
+        # 仅供回归测试注入：在读事务内、读完 scores 行、读 anchors 行之前
+        # 回调 (score_id)，用于确定性地制造“查询与发布交错”。生产路径恒为 None。
+        self.before_anchor_read: Optional[Callable[[str], None]] = None
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
@@ -127,17 +135,37 @@ class Store:
         return self.get_score(score_id)
 
     def get_score(self, score_id: str) -> dict:
-        """返回谱例与其全部锚点；不存在抛 :class:`ScoreNotFound`。"""
-        with self._connect() as conn:
+        """返回谱例与其全部锚点；不存在抛 :class:`ScoreNotFound`。
+
+        两条 SELECT 在同一个 ``BEGIN DEFERRED`` 读事务（WAL 下为一次固定
+        读快照）内执行：即便读锚点前恰好有另一个发布提交，本查询看到的
+        修订号、速度点与全部锚点仍同属一个已提交修订，杜绝跨修订拼接。
+        """
+        conn = self._connect()
+        try:
+            # DEFERRED 首条 SELECT 才取读锁；快照在该语句建立后固定。
+            conn.execute("BEGIN DEFERRED")
             row = conn.execute(
                 "SELECT * FROM scores WHERE id = ?", (score_id,)
             ).fetchone()
             if row is None:
+                conn.rollback()
                 raise ScoreNotFound(score_id)
+            # 测试注入点（生产环境为 no-op）：在此刻让另一连接提交发布。
+            if self.before_anchor_read is not None:
+                self.before_anchor_read(score_id)
             anchor_rows = conn.execute(
                 "SELECT * FROM anchors WHERE score_id = ? ORDER BY position_index",
                 (score_id,),
             ).fetchall()
+            conn.commit()
+        except ScoreNotFound:
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
         return self._hydrate(row, anchor_rows)
 
     def publish_revision(

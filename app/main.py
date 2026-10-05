@@ -23,7 +23,7 @@ app = FastAPI(
         "支持阶梯（step）与线性（linear）BPM 速度点、拍号表及 PPQ；"
         "并提供带录音锚点的速度图修订（创建/预览/发布，乐观锁修订号）。"
     ),
-    version="1.1.0",
+    version="1.1.1",
 )
 
 # SQLite 持久化（默认 ./data/tempo.db，可用 TEMPO_DB_PATH 覆盖；
