@@ -109,7 +109,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    **409**（响应体含 `expected_revision` 与 `current_revision`），
    不会覆盖新版本。
 5. **查询** `GET /scores/{id}`：返回**同一版本**的速度图、修订号与锚点
-   （锁定秒数、未锁定当前秒数、冻结阈值）。
+   （锁定秒数、未锁定当前秒数、冻结阈值）。服务端在**单个读事务**内
+   一次读出谱例行与全部锚点行（共用同一已提交快照），因此与发布交错时
+   结果要么是发布前的**完整旧修订**，要么是发布后的**完整新修订**，
+   不会出现“旧修订号/旧速度点配上新修订锚点秒数”的跨修订拼接
+   （WAL 下读不阻塞写，并发发布照常提交）。
 6. 数据保存到 **SQLite**（WAL 模式，发布用 `BEGIN IMMEDIATE` 串行化），
    Docker Compose 命名卷持久化，**重启后仍可读取**。
 
@@ -231,8 +235,38 @@ curl -i -X POST http://localhost:8000/scores/$SID/revisions/0/publish \
 
 ```bash
 curl -s http://localhost:8000/scores/$SID
-# -> "revision": 1，"tempo_points" 为 60 BPM，锚点 current_seconds 与该版本一致
 ```
+
+上一步发布成功后，返回的 `revision`、`tempo_points` 与每个锚点的
+`current_seconds` 必定描述**同一次修订**（rev1 / 60 BPM / 4.0 s）：
+
+```json
+{
+  "id": "ac0224ce71d34c90bbe6f3a917602bbe",
+  "revision": 1,
+  "ppq": 480,
+  "time_signatures": [],
+  "tempo_points": [{"position": "1:1:0", "bpm": 60.0, "curve": "step"}],
+  "anchors": [
+    {"index": 0, "position": "1:1:0", "locked": true,
+     "total_ticks": 0, "original_seconds": 0.0,
+     "current_seconds": 0.0, "tick_seconds": 0.0010416666666666667},
+    {"index": 1, "position": "2:1:0", "locked": false,
+     "total_ticks": 1920, "original_seconds": 2.0,
+     "current_seconds": 4.0, "tick_seconds": 0.0010416666666666075}
+  ]
+}
+```
+
+要点：
+
+- `revision` 与 `tempo_points`、所有 `anchors[*]` 取自**同一已提交快照**；
+  即使查询过程中恰好有发布提交，也只会整体返回旧修订或整体返回新修订，
+  绝不会返回“旧修订号 + 新锚点秒数”的拼接结果（例如 rev0 / 120 BPM
+  却带上 rev1 / 60 BPM 才有的 `4.0` s）。
+- `original_seconds` / `tick_seconds` 是创建时冻结值，任何修订都不变；
+  锁定锚点的 `current_seconds` 也保持冻结值，未锁定锚点随发布更新。
+- 谱例不存在时返回 **404**。
 
 ---
 
@@ -541,7 +575,10 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 阈值、预览返回原/新秒数与偏移且不落库、预览/发布的修订号 409、锁定冲突
 422（带锚点索引且数据不变）、偏移恰好等于一 tick 放行、成功发布原子更新
 速度图/未锁定锚点/修订号且锁定秒数不变、按当前修订连续发布、404，以及
-用独立 SQLite 文件重新打开（模拟 Compose 重启）后数据仍可读。
+用独立 SQLite 文件重新打开（模拟 Compose 重启）后数据仍可读。另有
+**可控读写交错回归**：在 `GET /scores/{id}` 读谱例行与读锚点行之间，由
+另一连接真实提交一次发布，断言返回的修订号、速度点与全部锚点秒数取自
+同一快照（完整旧修订或完整新修订），不发生跨修订拼接。
 
 ## 项目结构
 

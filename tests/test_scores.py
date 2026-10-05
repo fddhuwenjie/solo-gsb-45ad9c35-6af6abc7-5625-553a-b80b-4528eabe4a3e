@@ -429,3 +429,123 @@ def test_persistence_across_store_restart(fresh_db):
     # 锁定锚点的冻结秒数与一 tick 阈值都还在
     assert math.isclose(stored["anchors"][0]["original_seconds"], 0.0)
     assert math.isclose(stored["anchors"][0]["tick_seconds"], 0.5 / 480)
+
+
+# ---------------------------------------------------------------------- #
+# 读写交错：GET 不得跨修订拼接（速度点/修订号与全部锚点须取自同一快照）
+# ---------------------------------------------------------------------- #
+def _publish_from_other_connection(db_path, sid, expected_revision, points):
+    """用独立 Store 连接（同一 SQLite 文件）真实提交一次发布。
+
+    绕过 TestClient 门户线程，直接走发布代码路径（BEGIN IMMEDIATE +
+    乐观锁 + 提交），以便确定性地插到 GET 的两次读取之间。
+    """
+    from app.db import Store
+    from app.main import _build_map, _evaluate_replacement
+
+    writer = Store(str(db_path))
+    score = writer.get_score(sid)
+    candidate_map = _build_map(score["ppq"], score["time_signatures"], points)
+    evaluated = _evaluate_replacement(
+        candidate_map, score["anchors"], raise_on_conflict=True
+    )
+    return writer.publish_revision(sid, expected_revision, points, evaluated)
+
+
+def _assert_coherent_revision(data, *, revision, bpm, unlocked_seconds):
+    """速度点、修订号与全部锚点必须描述同一次修订，不得拼接。"""
+    assert data["revision"] == revision
+    assert data["tempo_points"][0]["bpm"] == bpm
+    assert math.isclose(data["anchors"][0]["current_seconds"], 0.0)  # 锁定秒数
+    assert math.isclose(data["anchors"][1]["current_seconds"], unlocked_seconds)
+
+
+def test_get_does_not_splice_across_concurrent_publish(monkeypatch, fresh_db):
+    """发布恰好提交在 GET 的“谱例行已读、锚点行未读”之间。
+
+    修复前两条 SELECT 各自取最新快照：旧修订号 0 + 旧速度点 120 BPM，
+    却配上新修订未锁定锚点的 4.0s（新图 60 BPM）。修复后锚点仍取自
+    读事务开始时的快照，返回完整的旧修订。
+    """
+    db_path = fresh_db
+    sid = create_score()["id"]
+    published = []
+
+    from app.db import Store
+
+    real_read_anchor_rows = Store._read_anchor_rows
+
+    def read_anchor_rows_with_publish_then_read(self, conn, score_id, *args, **kwargs):
+        # 此刻谱例行（旧修订）已在同一读事务内读出；在锚点读取前，
+        # 另一连接完整提交 rev0 -> rev1（120 BPM -> 60 BPM）。
+        # 先置标志再发布：发布辅助内部自身的 get_score 也走本钩子。
+        if score_id == sid and not published:
+            published.append(True)
+            result = _publish_from_other_connection(db_path, sid, 0, SLOW_POINTS)
+            published[0] = result
+        return real_read_anchor_rows(self, conn, score_id, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "_read_anchor_rows", read_anchor_rows_with_publish_then_read)
+
+    got = client.get(f"/scores/{sid}")
+    assert got.status_code == 200, got.text
+    data = got.json()
+    # 旧快照：revision=0、120 BPM，未锁定锚点必须仍是旧图的 2.0s，
+    # 绝不能是新图 60 BPM 的 4.0s（跨修订拼接）。
+    _assert_coherent_revision(data, revision=0, bpm=120, unlocked_seconds=2.0)
+    assert len(published) == 1
+
+    # 下一次查询读到完整的新修订
+    new = client.get(f"/scores/{sid}").json()
+    _assert_coherent_revision(new, revision=1, bpm=60, unlocked_seconds=4.0)
+
+
+def test_get_publish_between_row_and_anchors_never_splices_fast(monkeypatch, fresh_db):
+    """同一交错点，发布方向改为 120 -> 240 BPM：旧快照里锚点保持 2.0s。"""
+    db_path = fresh_db
+    sid = create_score()["id"]
+    fired = {"done": False}
+
+    from app.db import Store
+
+    real_read_anchor_rows = Store._read_anchor_rows
+
+    def read_anchor_rows(self, conn, score_id, *args, **kwargs):
+        if score_id == sid and not fired["done"]:
+            fired["done"] = True
+            _publish_from_other_connection(db_path, sid, 0, FAST_POINTS)
+        return real_read_anchor_rows(self, conn, score_id, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "_read_anchor_rows", read_anchor_rows)
+
+    data = client.get(f"/scores/{sid}").json()
+    _assert_coherent_revision(data, revision=0, bpm=120, unlocked_seconds=2.0)
+
+    new = client.get(f"/scores/{sid}").json()
+    _assert_coherent_revision(new, revision=1, bpm=240, unlocked_seconds=1.0)
+
+
+def test_get_publish_completes_before_anchor_snapshot_yields_old_or_new(monkeypatch, fresh_db):
+    """发布在“谱例行读取之前”已提交时，查询应返回完整新修订（另一允许结果）。"""
+    db_path = fresh_db
+    sid = create_score()["id"]
+    fired = {"done": False}
+
+    from app.db import Store
+
+    real_read_score_row = Store._read_score_row
+
+    def read_score_row(self, conn, score_id, *args, **kwargs):
+        # 只在 GET 自己的首次读（发布尚未发生）前插入发布；
+        # 发布辅助内部 get_score 的重读必须放行，否则无限递归。
+        if score_id == sid and not fired["done"]:
+            fired["done"] = True
+            _publish_from_other_connection(db_path, sid, 0, SLOW_POINTS)
+        return real_read_score_row(self, conn, score_id, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "_read_score_row", read_score_row)
+
+    data = client.get(f"/scores/{sid}").json()
+    # 读事务的第一条 SELECT 在发布提交之后才取快照 -> 完整新修订
+    _assert_coherent_revision(data, revision=1, bpm=60, unlocked_seconds=4.0)
+

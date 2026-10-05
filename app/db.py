@@ -10,6 +10,10 @@
 发布是单事务：``BEGIN IMMEDIATE`` 取得写锁后按 revision 做乐观并发控制
 （预期修订号不匹配 -> 409），成功则一次更新速度图、未锁定锚点秒数和
 修订号，锁定锚点秒数不变。进程内再用一把锁串行化写事务。
+
+查询同样是单事务：``GET /scores`` 在同一显式读事务内读取谱例行与全部
+锚点行，二者共用一个已提交快照，避免与发布交错时跨修订拼接
+（旧修订号配新锚点秒数）。
 """
 
 from __future__ import annotations
@@ -127,18 +131,41 @@ class Store:
         return self.get_score(score_id)
 
     def get_score(self, score_id: str) -> dict:
-        """返回谱例与其全部锚点；不存在抛 :class:`ScoreNotFound`。"""
+        """返回谱例与其全部锚点；不存在抛 :class:`ScoreNotFound`。
+
+        两张表在**同一个显式读事务**（延迟事务，快照取自第一条 SELECT）
+        内读取：与发布交错时，整次查询要么读到发布前的完整旧修订，
+        要么读到发布后的完整新修订，不会出现“旧修订号 + 旧速度点 +
+        新修订锚点秒数”的跨修订拼接（WAL 下读者不阻塞写者提交）。
+        """
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM scores WHERE id = ?", (score_id,)
-            ).fetchone()
+            conn.execute("BEGIN")
+            row = self._read_score_row(conn, score_id)
             if row is None:
+                conn.rollback()
                 raise ScoreNotFound(score_id)
-            anchor_rows = conn.execute(
-                "SELECT * FROM anchors WHERE score_id = ? ORDER BY position_index",
-                (score_id,),
-            ).fetchall()
+            # 读锚点前即使另一连接提交了发布，本事务仍持第一条 SELECT
+            # 取得的快照，锚点与谱例行必然来自同一次已提交修订。
+            anchor_rows = self._read_anchor_rows(conn, score_id)
+            conn.commit()
         return self._hydrate(row, anchor_rows)
+
+    def _read_score_row(
+        self, conn: sqlite3.Connection, score_id: str
+    ) -> Optional[sqlite3.Row]:
+        """读谱例行（独立方法，便于测试在该行读取前后插入发布）。"""
+        return conn.execute(
+            "SELECT * FROM scores WHERE id = ?", (score_id,)
+        ).fetchone()
+
+    def _read_anchor_rows(
+        self, conn: sqlite3.Connection, score_id: str
+    ) -> list[sqlite3.Row]:
+        """读全部锚点行；须在 :meth:`get_score` 的同一读事务内调用。"""
+        return conn.execute(
+            "SELECT * FROM anchors WHERE score_id = ? ORDER BY position_index",
+            (score_id,),
+        ).fetchall()
 
     def publish_revision(
         self,
